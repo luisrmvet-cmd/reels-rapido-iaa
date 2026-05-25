@@ -1,0 +1,205 @@
+import { NextRequest, NextResponse } from "next/server";
+import path from "path";
+import fs from "fs";
+import os from "os";
+import { bundle } from "@remotion/bundler";
+import { renderMedia, selectComposition } from "@remotion/renderer";
+import { ID_COMPOSICAO } from "@/remotion/constantes";
+import { gerarVozTTS } from "@/lib/tts";
+import type {
+  PayloadRender,
+  PropsVideoReel,
+  AudioNarracao,
+} from "@/types/video";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 300;
+
+let bundleCache: string | null = null;
+
+/**
+ * Resolve o caminho da raiz do projeto de forma robusta.
+ *
+ * Em dev local: process.cwd() é a raiz do projeto → funciona.
+ * Em Vercel serverless: process.cwd() é "/var/task" e os arquivos
+ * estão em "/var/task/src/...". Ambos os casos resolvem corretamente
+ * porque a Vercel mantém a estrutura `src/` no bundle quando os
+ * arquivos são incluídos via `outputFileTracingIncludes`
+ * (configurado em next.config.js).
+ */
+function resolverEntryRemotion(): { entry: string; srcDir: string } {
+  const cwd = process.cwd();
+  // Tenta primeiro o caminho a partir de cwd
+  const candidatos = [
+    path.join(cwd, "src", "remotion", "index.ts"),
+    // Em alguns ambientes Vercel, os arquivos ficam em subpasta
+    path.join(cwd, ".next", "server", "src", "remotion", "index.ts"),
+  ];
+
+  for (const c of candidatos) {
+    if (fs.existsSync(c)) {
+      return {
+        entry: c,
+        srcDir: path.join(path.dirname(c), ".."),
+      };
+    }
+  }
+
+  // Fallback: retorna o primeiro mesmo que não exista (vai dar erro claro)
+  return {
+    entry: candidatos[0],
+    srcDir: path.join(cwd, "src"),
+  };
+}
+
+async function obterBundle(): Promise<string> {
+  if (bundleCache && fs.existsSync(bundleCache)) {
+    return bundleCache;
+  }
+  const { entry, srcDir } = resolverEntryRemotion();
+
+  if (!fs.existsSync(entry)) {
+    throw new Error(
+      `[Remotion] Arquivo de entrada não encontrado: ${entry}. ` +
+        `Verifique se 'outputFileTracingIncludes' está configurado em next.config.js ` +
+        `para incluir 'src/remotion/**' na função /api/render.`
+    );
+  }
+
+  const out = await bundle({
+    entryPoint: entry,
+    webpackOverride: (config) => ({
+      ...config,
+      resolve: {
+        ...(config.resolve ?? {}),
+        // Garante que .tsx e .ts sejam resolvidos sem extensão
+        extensions: [
+          ...((config.resolve && config.resolve.extensions) || []),
+          ".ts",
+          ".tsx",
+          ".js",
+          ".jsx",
+        ],
+        alias: {
+          ...((config.resolve && config.resolve.alias) || {}),
+          "@": srcDir,
+        },
+      },
+    }),
+  });
+  bundleCache = out;
+  return out;
+}
+
+/**
+ * Detecta automaticamente o primeiro mp3 em /public/audio para usar como música.
+ * Retorna URL absoluta ou null.
+ */
+function detectarMusicaAutomatica(origin: string): string | null {
+  try {
+    const dir = path.join(process.cwd(), "public", "audio");
+    if (!fs.existsSync(dir)) return null;
+    const arquivo = fs
+      .readdirSync(dir)
+      .find((nome) => /\.(mp3|m4a|wav|ogg)$/i.test(nome));
+    return arquivo ? `${origin}/audio/${arquivo}` : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+process.env.REMOTION_BROWSER_CACHE_DIR = "/tmp/remotion";
+process.env.REMOTION_CACHE_DIR = "/tmp/remotion";
+
+fs.mkdirSync("/tmp/remotion", { recursive: true });
+
+const body = (await req.json()) as PayloadRender;
+
+    if (!body?.roteiro || !Array.isArray(body.imagens)) {
+      return NextResponse.json({ erro: "Payload inválido" }, { status: 400 });
+    }
+
+    // ===== Gerar narrações TTS (se solicitado) =====
+    let narracoes: (AudioNarracao | null)[] | null = null;
+    if (body.comVoz) {
+      narracoes = [];
+      for (const cena of body.roteiro.cenas) {
+        const texto = cena.narracao?.trim() || cena.textoTela?.trim() || "";
+        if (!texto) {
+          narracoes.push(null);
+          continue;
+        }
+        const resultado = await gerarVozTTS(texto, body.vozId);
+        if (!resultado) {
+          narracoes.push(null);
+          continue;
+        }
+        const dataUrl = `data:audio/mp3;base64,${resultado.buffer.toString("base64")}`;
+        narracoes.push({
+          dataUrl,
+          duracaoSegundos: resultado.duracaoSegundos,
+          palavrasComTempo: resultado.palavras.length > 0 ? resultado.palavras : null,
+        });
+      }
+    }
+
+    // ===== Música =====
+    const musicaUrl = body.comMusica
+      ? detectarMusicaAutomatica(req.nextUrl.origin)
+      : null;
+
+    // ===== Props da composição =====
+    const propsVideo: PropsVideoReel = {
+      capa: body.roteiro.capa,
+      cenas: body.roteiro.cenas,
+      ctaFinal: body.roteiro.ctaFinal,
+      imagens: body.imagens,
+      musicaUrl,
+      template: body.template,
+      comLegendaPalavraPalavra: body.comLegendaPalavraPalavra,
+      narracoes,
+    };
+
+    const bundleLocation = await obterBundle();
+
+    const composicao = await selectComposition({
+      serveUrl: bundleLocation,
+      id: ID_COMPOSICAO,
+      inputProps: propsVideo,
+    });
+
+    const nomeArquivo = `reel-${Date.now()}.mp4`;
+    const caminhoSaida = path.join(os.tmpdir(), nomeArquivo);
+
+    await renderMedia({
+      composition: composicao,
+      serveUrl: bundleLocation,
+      codec: "h264",
+      outputLocation: caminhoSaida,
+      inputProps: propsVideo,
+      imageFormat: "jpeg",
+      jpegQuality: 95, // ↑ qualidade dos frames
+      crf: 18, // CRF baixo = melhor qualidade visual (18 é "visually lossless")
+      enforceAudioTrack: true, // garante track de áudio mesmo se não houver som
+    });
+
+    const buffer = fs.readFileSync(caminhoSaida);
+    fs.unlinkSync(caminhoSaida);
+
+    return new NextResponse(new Uint8Array(buffer), {
+      status: 200,
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Disposition": `attachment; filename="${nomeArquivo}"`,
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch (e) {
+    console.error("Erro no render:", e);
+    const msg = e instanceof Error ? e.message : "Erro desconhecido";
+    return NextResponse.json({ erro: msg }, { status: 500 });
+  }
+}

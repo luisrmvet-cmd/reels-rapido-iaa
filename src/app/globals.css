@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background-color: #0a0a0a;
+  color: #fff;
+}
+
+/* Remove tap highlight azul do mobile */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Inputs do iOS sem zoom */
+input,
+textarea,
+select {
+  font-size: 16px;
+}
+
+/* Safe area iOS */
+body {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}

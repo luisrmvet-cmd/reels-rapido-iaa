@@ -1,0 +1,55 @@
+/** @type {import('next').NextConfig} */
+const withPWA = require("next-pwa")({
+  dest: "public",
+  register: true,
+  skipWaiting: true,
+  disable: process.env.NODE_ENV === "development",
+});
+
+const nextConfig = {
+  reactStrictMode: true,
+
+  // Remotion usa pacotes nativos (Chromium/FFmpeg) que não devem ser bundled
+  serverExternalPackages: [
+    "@remotion/bundler",
+    "@remotion/renderer",
+    "@remotion/compositor-linux-x64-gnu",
+    "@remotion/compositor-linux-x64-musl",
+    "@remotion/compositor-linux-arm64-gnu",
+    "@remotion/compositor-linux-arm64-musl",
+    "@remotion/compositor-darwin-x64",
+    "@remotion/compositor-darwin-arm64",
+    "@remotion/compositor-win32-x64-msvc",
+  ],
+
+  experimental: {
+    serverComponentsExternalPackages: [
+      "@remotion/bundler",
+      "@remotion/renderer",
+    ],
+
+    /**
+     * CRUCIAL para Vercel/serverless:
+     * A função /api/render lê src/remotion/*.tsx via filesystem em runtime,
+     * via @remotion/bundler. Como o entryPoint é uma string path (não import
+     * estático), o tracing automático do Next NÃO inclui esses arquivos no
+     * bundle da função — causando "Module not found: Can't resolve './Root'"
+     * em produção.
+     *
+     * No Next 14, esta config fica dentro de `experimental.`
+     * (No Next 15 foi promovida para top-level outputFileTracingIncludes)
+     *
+     * Os globs aqui são RELATIVOS À RAIZ do projeto.
+     */
+    outputFileTracingIncludes: {
+      "/api/render": [
+        "./src/remotion/**/*",
+        "./src/components/**/*",
+        "./src/lib/**/*",
+        "./src/types/**/*",
+      ],
+    },
+  },
+};
+
+module.exports = withPWA(nextConfig);
