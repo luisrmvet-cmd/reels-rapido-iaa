@@ -75,6 +75,13 @@ export type EstadoRender =
   | { tipo: "idle" }
   | { tipo: "preparando" }
   | { tipo: "gerando_voz"; cenaAtual: number; totalCenas: number }
-  | { tipo: "renderizando"; progresso: number }
-  | { tipo: "concluido"; videoUrl: string }
-  | { tipo: "erro"; mensagem: string };
+  | { tipo: "renderizando"; progresso: number; etapa?: string }
+  | { tipo: "concluido"; videoUrl: string; urlDownloadDireto?: string }
+  | {
+      tipo: "erro";
+      mensagem: string;
+      debug?: {
+        endpoint: string;
+        timestamp: string;
+      };
+    };

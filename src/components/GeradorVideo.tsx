@@ -1,16 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { RoteiroGerado, ImagemUpload } from "@/types";
+import type { RoteiroGerado, ImagemUpload } from "../types";
 import type {
   EstadoRender,
   PayloadRender,
   IdTemplate,
   IdVoz,
-} from "@/types/video";
-import { TEMPLATE_DEFAULT } from "@/lib/templates";
-import { VOZ_DEFAULT } from "@/lib/vozes";
-import { prepararImagens } from "@/lib/preparoImagens";
+} from "../types/video";
+import { TEMPLATE_DEFAULT } from "../lib/templates";
+import { VOZ_DEFAULT } from "../lib/vozes";
+import { prepararImagens } from "../lib/preparoImagens";
 import SeletorTemplate from "./SeletorTemplate";
 import SeletorVoz from "./SeletorVoz";
 import SeletorVideoFundo from "./SeletorVideoFundo";
@@ -62,11 +62,42 @@ export default function GeradorVideo({ roteiro: roteiroInicial, imagens }: Props
   }, [estado]);
 
   async function gerarVideo() {
-    try {
-      if (estado.tipo === "concluido") {
-        URL.revokeObjectURL(estado.videoUrl);
-      }
+    // Limpa COMPLETAMENTE qualquer estado anterior (erro, vídeo pronto, etc)
+    // antes de começar nova tentativa. Evita que mensagens antigas fiquem
+    // visíveis na tela durante o novo render.
+    if (estado.tipo === "concluido") {
+      URL.revokeObjectURL(estado.videoUrl);
+    }
+    setEstado({ tipo: "idle" });
 
+    const timestampTentativa = new Date().toISOString();
+
+    // Chama o servico de render direto, sem passar pela Vercel.
+    // Vercel tem timeout de 60s -> renders longos dao 504.
+    // Render.com nao tem esse limite.
+    const renderServiceUrl = process.env.NEXT_PUBLIC_RENDER_SERVICE_URL;
+    if (!renderServiceUrl) {
+      console.error(
+        "[render] NEXT_PUBLIC_RENDER_SERVICE_URL nao configurada. Definir em Vercel > Settings > Environment Variables e fazer Redeploy."
+      );
+      setEstado({
+        tipo: "erro",
+        mensagem:
+          "Servico de render nao configurado. Falta env var NEXT_PUBLIC_RENDER_SERVICE_URL no Vercel.",
+        debug: {
+          endpoint: "(nao configurado)",
+          timestamp: timestampTentativa,
+        },
+      });
+      return;
+    }
+    const endpoint = `${renderServiceUrl.replace(/\/+$/, "")}/render`;
+    console.log("[render] usando endpoint:", endpoint);
+
+    // alias usado pelo logging mais abaixo
+    const endpointDestino = endpoint;
+
+    try {
       setEstado({ tipo: "preparando" });
       const imagensSerializadas = await prepararImagens(imagens);
 
@@ -134,71 +165,216 @@ export default function GeradorVideo({ roteiro: roteiroInicial, imagens }: Props
         videoFundoUrl,
       };
 
-      const resp = await fetch("/api/render", {
-method: "POST",
-headers: { "Content-Type": "application/json" },
-body: JSON.stringify(payload),
-});
+      console.log(
+        `[debug-render] ${timestampTentativa} POST ${endpointDestino}`,
+        { payload: { ...payload, imagens: `${payload.imagens.length} imagens` } }
+      );
 
-if (!resp.ok) {
-throw new Error("Falha ao iniciar render");
-}
+      // =================================================================
+      // FASE 1: POST /render → recebe { jobId }
+      // =================================================================
+      const respPost = await fetch(endpointDestino, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
 
-const data = await resp.json();
+      if (!respPost.ok) {
+        clearInterval(intervalProgresso);
+        const erroTexto = await respPost.text();
+        let mensagem = `HTTP ${respPost.status} ${respPost.statusText}`;
+        try {
+          const erroJson = JSON.parse(erroTexto);
+          if (erroJson?.erro) mensagem = erroJson.erro;
+          else if (erroJson?.error) mensagem = erroJson.error;
+          else if (erroJson?.message) mensagem = erroJson.message;
+        } catch {
+          if (erroTexto && erroTexto.length < 500) mensagem = erroTexto;
+        }
+        console.error(`[debug-render] erro POST /render:`, erroTexto);
+        throw new Error(mensagem);
+      }
 
-if (!data?.jobId) {
-throw new Error("jobId não recebido");
-}
+      const { jobId } = (await respPost.json()) as { jobId: string };
+      if (!jobId) {
+        clearInterval(intervalProgresso);
+        throw new Error("Resposta sem jobId");
+      }
+      console.log(`[debug-render] jobId recebido: ${jobId}`);
 
-let progressoFake = 5;
+      // Para a barra falsa - vamos usar progresso real do servidor
+      clearInterval(intervalProgresso);
 
-const polling = setInterval(async () => {
-try {
-progressoFake = Math.min(progressoFake + 5, 95);
+      // =================================================================
+      // FASE 2: polling em /jobs/:id/status a cada 2s, ate done/error
+      // =================================================================
+      const TIMEOUT_TOTAL_MS = 8 * 60 * 1000; // 8min - timeout de seguranca
+      const INTERVALO_POLLING_MS = 2000;
+      const inicioPolling = Date.now();
+      const statusUrl = `${endpointDestino.replace(/\/render$/, "")}/jobs/${jobId}/status`;
+      const videoUrl = `${endpointDestino.replace(/\/render$/, "")}/jobs/${jobId}/video`;
 
-setEstado((old) => ({
-...old,
-progresso: progressoFake / 100,
-}));
+      type EstadoJob = "pending" | "rendering" | "done" | "error";
+      let estadoJob: EstadoJob = "pending";
+      let mensagemErro = "";
+      let progressoJob = 0;
+      let etapaAtual = "iniciando";
+      let falhasPolling = 0;
+      let pollNumero = 0;
 
-const statusResp = await fetch(
-`https://reels-render-service.onrender.com/status/${data.jobId}`
-);
+      while (Date.now() - inicioPolling < TIMEOUT_TOTAL_MS) {
+        await new Promise((r) => setTimeout(r, INTERVALO_POLLING_MS));
+        pollNumero++;
 
-if (!statusResp.ok) return;
+        let dataStatus: {
+          estado: EstadoJob;
+          progresso: number;
+          etapa: string;
+          videoUrl?: string;
+          erro?: string;
+          tempoNaEtapa?: number;
+          tempoTotal?: number;
+        };
+        try {
+          const respStatus = await fetch(statusUrl);
+          if (!respStatus.ok) {
+            falhasPolling++;
+            console.warn(
+              `[debug-render] poll ${pollNumero}: status HTTP ${respStatus.status} (falha ${falhasPolling}/3)`
+            );
+            setEstado({
+              tipo: "renderizando",
+              progresso: progressoJob,
+              etapa: falhasPolling >= 3 ? "verificando conexao..." : etapaAtual,
+            });
+            continue;
+          }
+          dataStatus = await respStatus.json();
+          falhasPolling = 0;
+        } catch (e) {
+          falhasPolling++;
+          console.warn(
+            `[debug-render] poll ${pollNumero}: erro de rede (falha ${falhasPolling}/3):`,
+            e
+          );
+          setEstado({
+            tipo: "renderizando",
+            progresso: progressoJob,
+            etapa: falhasPolling >= 3 ? "verificando conexao..." : etapaAtual,
+          });
+          continue;
+        }
 
-const statusData = await statusResp.json();
+        // LOG COMPLETO do retorno do status pra debug
+        console.log(
+          `[debug-render] poll ${pollNumero} status RAW:`,
+          JSON.stringify(dataStatus)
+        );
 
-if (statusData.status === "done" && statusData.url) {
-clearInterval(polling);
-clearInterval(intervalProgresso);
+        estadoJob = dataStatus.estado;
+        progressoJob = (dataStatus.progresso ?? 0) / 100;
+        etapaAtual = dataStatus.etapa || "processando";
 
-setEstado({
-tipo: "concluido",
-videoUrl: statusData.url,
-});
-}
+        setEstado({
+          tipo: "renderizando",
+          progresso: Math.min(0.99, progressoJob),
+          etapa: etapaAtual,
+        });
 
-if (statusData.status === "error") {
-clearInterval(polling);
-throw new Error("Erro no render");
-}
-} catch (e) {
-console.error(e);
-}
-}, 3000);
+        // Alarme se vier estado inesperado (nao deveria acontecer)
+        if (
+          estadoJob !== "pending" &&
+          estadoJob !== "rendering" &&
+          estadoJob !== "done" &&
+          estadoJob !== "error"
+        ) {
+          console.error(
+            `[debug-render] poll ${pollNumero}: estado DESCONHECIDO=${estadoJob}. Backend mudou?`
+          );
+        }
 
+        if (estadoJob === "done") {
+          console.log(`[debug-render] poll ${pollNumero}: estado=done CONFIRMADO. Vou baixar MP4.`);
+          break;
+        }
+        if (estadoJob === "error") {
+          mensagemErro = dataStatus.erro || "Render falhou";
+          console.error(`[debug-render] poll ${pollNumero}: estado=error. erro="${mensagemErro}"`);
+          break;
+        }
+      }
+
+      if (estadoJob === "error") throw new Error(mensagemErro);
+      if (estadoJob !== "done") {
+        throw new Error(
+          `Render demorou mais que 8 minutos sem terminar (ultima etapa: ${etapaAtual}). O servidor pode estar travado - tente de novo em alguns minutos.`
+        );
+      }
+
+      // =================================================================
+      // FASE 3: baixar o MP4
+      // =================================================================
+      console.log(`[debug-render] baixando MP4 de ${videoUrl}`);
+      const respVideo = await fetch(videoUrl);
+      if (!respVideo.ok) {
+        throw new Error(`Falha ao baixar MP4: HTTP ${respVideo.status}`);
+      }
+      const blob = await respVideo.blob();
+      console.log(
+        `[debug-render] MP4 baixado, tamanho=${(blob.size / 1024 / 1024).toFixed(2)}MB type=${blob.type}`
+      );
+
+      // Sanidade: MP4 deve ter pelo menos 10KB e tipo video/mp4 ou application/octet-stream
+      if (blob.size < 10000) {
+        throw new Error(
+          `MP4 invalido: tamanho=${blob.size} bytes (esperado > 10KB). Servidor pode ter gerado arquivo corrompido.`
+        );
+      }
+      if (
+        blob.type &&
+        !blob.type.includes("video") &&
+        !blob.type.includes("octet-stream")
+      ) {
+        console.warn(
+          `[debug-render] AVISO: blob.type=${blob.type} (esperado video/mp4)`
+        );
+      }
+
+      const url = URL.createObjectURL(blob);
+      // Player local usa blob URL (necessario pro <video> tocar imediato)
+      // Botao baixar usa URL direta do backend (evita re-download em memoria)
+      setEstado({
+        tipo: "concluido",
+        videoUrl: url,
+        urlDownloadDireto: videoUrl,
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Erro desconhecido";
-      setEstado({ tipo: "erro", mensagem: msg });
+      console.error(`[debug-render] ERRO em ${timestampTentativa}:`, msg);
+      setEstado({
+        tipo: "erro",
+        mensagem: msg,
+        debug: {
+          endpoint: endpointDestino,
+          timestamp: timestampTentativa,
+        },
+      });
     }
   }
 
   function baixar() {
     if (estado.tipo !== "concluido") return;
+    // Prefere URL direta do servidor (mais leve, suporta range requests).
+    // Fallback pra blob URL local se o servidor nao retornou URL direta.
+    const urlParaBaixar = estado.urlDownloadDireto ?? estado.videoUrl;
     const a = document.createElement("a");
-    a.href = estado.videoUrl;
+    a.href = urlParaBaixar;
     a.download = `reel-${Date.now()}.mp4`;
+    // target=_blank ajuda em alguns navegadores quando href eh cross-origin
+    if (estado.urlDownloadDireto) {
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+    }
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -380,8 +556,13 @@ console.error(e);
               <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/30 to-transparent animate-pulse" />
             </div>
           </div>
+          {estado.etapa && (
+            <p className="text-xs text-zinc-400 text-center font-mono">
+              {estado.etapa}
+            </p>
+          )}
           <p className="text-xs text-zinc-500 text-center">
-            Isso pode demorar 30-90 segundos. Não feche a aba.
+            Isso pode demorar 60-180 segundos para 15s de vídeo. Não feche a aba.
           </p>
         </div>
       )}
@@ -418,9 +599,29 @@ console.error(e);
           <div className="bg-red-500/10 border border-red-500/30 text-red-300 text-sm rounded-2xl p-3">
             ❌ {estado.mensagem}
           </div>
+
+          {/* Bloco de debug temporário - mostra:
+              - endpoint chamado (deve ser https://reels-render-service.onrender.com/render)
+              - timestamp da tentativa (confirma que é nova, não cache antigo)
+          */}
+          {estado.debug && (
+            <div className="bg-zinc-800/60 border border-zinc-700 text-zinc-400 text-[10px] rounded-2xl p-3 font-mono leading-relaxed">
+              <div>🔍 debug</div>
+              <div>endpoint: {estado.debug.endpoint}</div>
+              <div>timestamp: {estado.debug.timestamp}</div>
+            </div>
+          )}
+
           <button
             type="button"
-            onClick={() => setEstado({ tipo: "idle" })}
+            onClick={() => {
+              // Limpa COMPLETAMENTE o estado antes do retry.
+              // Próximo gerarVideo() vai começar do zero,
+              // sem mensagem antiga visível.
+              setEstado({ tipo: "idle" });
+              // Dispara nova tentativa
+              gerarVideo();
+            }}
             className="w-full py-3 rounded-2xl font-bold bg-zinc-800 text-white active:scale-95"
           >
             Tentar de novo
