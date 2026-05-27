@@ -135,21 +135,59 @@ export default function GeradorVideo({ roteiro: roteiroInicial, imagens }: Props
       };
 
       const resp = await fetch("/api/render", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+method: "POST",
+headers: { "Content-Type": "application/json" },
+body: JSON.stringify(payload),
+});
 
-      clearInterval(intervalProgresso);
+if (!resp.ok) {
+throw new Error("Falha ao iniciar render");
+}
 
-      if (!resp.ok) {
-        const erro = await resp.json().catch(() => ({ erro: "Falha no render" }));
-        throw new Error(erro?.erro || `HTTP ${resp.status}`);
-      }
+const data = await resp.json();
 
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      setEstado({ tipo: "concluido", videoUrl: url });
+if (!data?.jobId) {
+throw new Error("jobId não recebido");
+}
+
+let progressoFake = 5;
+
+const polling = setInterval(async () => {
+try {
+progressoFake = Math.min(progressoFake + 5, 95);
+
+setEstado((old) => ({
+...old,
+progresso: progressoFake / 100,
+}));
+
+const statusResp = await fetch(
+`https://reels-render-service.onrender.com/status/${data.jobId}`
+);
+
+if (!statusResp.ok) return;
+
+const statusData = await statusResp.json();
+
+if (statusData.status === "done" && statusData.url) {
+clearInterval(polling);
+clearInterval(intervalProgresso);
+
+setEstado({
+tipo: "concluido",
+videoUrl: statusData.url,
+});
+}
+
+if (statusData.status === "error") {
+clearInterval(polling);
+throw new Error("Erro no render");
+}
+} catch (e) {
+console.error(e);
+}
+}, 3000);
+
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Erro desconhecido";
       setEstado({ tipo: "erro", mensagem: msg });
