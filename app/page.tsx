@@ -1,65 +1,143 @@
-import Image from "next/image";
+// app/page.tsx
+"use client";
+
+import { useState } from "react";
 
 export default function Home() {
+  const [files, setFiles] = useState<File[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  function onPick(e: React.ChangeEvent<HTMLInputElement>) {
+    setFiles(Array.from(e.target.files ?? []));
+    setVideoUrl(null);
+    setError(null);
+  }
+
+  async function handleSubmit() {
+    setError(null);
+    setVideoUrl(null);
+
+    if (files.length === 0) {
+      setError("Selecione pelo menos uma imagem.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const fd = new FormData();
+      files.forEach((file, i) => fd.append(`image${i + 1}`, file));
+
+      const res = await fetch("/api/render", { method: "POST", body: fd });
+
+      // Lê como texto primeiro: assim, se o backend devolver HTML de erro,
+      // mostramos a causa real em vez de quebrar no JSON.parse.
+      const text = await res.text();
+      let data: { ok?: boolean; url?: string; error?: string };
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new Error(
+          `Resposta inválida do servidor (HTTP ${res.status}): ${text.slice(0, 200)}`
+        );
+      }
+
+      if (!res.ok || !data.ok || !data.url) {
+        throw new Error(data?.error || `Erro HTTP ${res.status}`);
+      }
+
+      setVideoUrl(data.url);
+      // Abre o MP4 em nova aba automaticamente.
+      window.open(data.url, "_blank");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Erro ao enviar imagens.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
+    <main
+      style={{
+        maxWidth: 480,
+        margin: "0 auto",
+        padding: 24,
+        fontFamily: "system-ui, sans-serif",
+      }}
+    >
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 16 }}>
+        ViralCut AI — Gerar vídeo vertical
+      </h1>
+
+      <input
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={onPick}
+        disabled={loading}
+        style={{ display: "block", marginBottom: 16 }}
+      />
+
+      {files.length > 0 && (
+        <p style={{ marginBottom: 16, color: "#555" }}>
+          {files.length} imagem(ns) selecionada(s).
+        </p>
+      )}
+
+      <button
+        onClick={handleSubmit}
+        disabled={loading || files.length === 0}
+        style={{
+          padding: "10px 20px",
+          fontSize: 16,
+          fontWeight: 600,
+          borderRadius: 8,
+          border: "none",
+          cursor: loading ? "not-allowed" : "pointer",
+          background: loading ? "#999" : "#111",
+          color: "#fff",
+        }}
+      >
+        {loading ? "Gerando vídeo..." : "Gerar MP4"}
+      </button>
+
+      {error && (
+        <p
+          style={{
+            marginTop: 16,
+            padding: 12,
+            borderRadius: 8,
+            background: "#fde8e8",
+            color: "#9b1c1c",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {error}
+        </p>
+      )}
+
+      {videoUrl && (
+        <div style={{ marginTop: 24 }}>
+          <video
+            src={videoUrl}
+            controls
+            style={{ width: "100%", borderRadius: 12, background: "#000" }}
+          />
           <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            href={videoUrl}
+            download="viralcut.mp4"
+            style={{
+              display: "inline-block",
+              marginTop: 12,
+              fontWeight: 600,
+              color: "#111",
+            }}
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
+            ⬇ Baixar MP4
           </a>
         </div>
-      </main>
-    </div>
+      )}
+    </main>
   );
 }
