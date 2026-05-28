@@ -162,6 +162,7 @@ export default function GeradorVideo({ roteiro: roteiroInicial, imagens }: Props
         comLegendaPalavraPalavra: comLegendaPPP,
         comVoz: comVoz && vozDisponivel,
         vozId,
+        duracaoSegundos: 30,
         videoFundoUrl,
       };
 

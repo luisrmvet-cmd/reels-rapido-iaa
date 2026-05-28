@@ -63,6 +63,7 @@ export interface PayloadRender {
   comLegendaPalavraPalavra: boolean;
   comVoz: boolean;
   vozId: IdVoz;
+  duracaoSegundos: number;
   /**
    * URL do vídeo de fundo (B-roll). Opcional.
    * Sub-etapa 8.1.A: aceito no payload mas ignorado pelo render.
